@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 if [ $# -lt 2 ]; then
 	echo "usage: $0 <filesdir> <searchstr>"
 	exit 1
