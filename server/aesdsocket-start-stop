@@ -2,12 +2,12 @@
 
 case "$1" in
   start)
-    log_daemon_msg "Starting aesdsocket daemon"
+    echo "Starting aesdsocket daemon"
     start-stop-daemon -S -n aesdsocket -x /usr/bin/aesdsocket -d
     log_end_msg $?
     ;;
   stop)
-    log_daemon_msg "Stopping aesdsocket daemon"
+    echo "Stopping aesdsocket daemon"
     start-stop-daemon -K -n aesdsocket
     ;;
   *)
