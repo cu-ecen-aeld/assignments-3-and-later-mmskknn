@@ -11,48 +11,137 @@
 #include <arpa/inet.h>
 #include <syslog.h>
 #include <sys/stat.h>
-#include <sys/select.h>
+#include <pthread.h>
+#include <sys/queue.h>
+#include <time.h>
 
-#define PORT        (9000)
-#define BACKLOG        (1)
-#define DATA_FILE    "/var/tmp/aesdsocketdata"
-#define BUFFER_SIZE    (1024)
+#define PORT					(9000)
+#define BACKLOG					(50)
+#define DATA_FILE				"/var/tmp/aesdsocketdata"
+#define BUFFER_SIZE				(1024)
+#define TIMESTAMP_INTERVAL_SEC	(10)
+#define TIMESTAMP_FORMAT		"%a, %d %b %Y %T %z\n"
 
 volatile sig_atomic_t server_stop = 0;
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+int sockfd = -1;
+FILE* fp = NULL;
+timer_t timerid;
+struct sigevent sev;
+struct itimerspec its;
+
+typedef struct thread_node {
+    pthread_t thread_id;
+    int client_fd;
+    SLIST_ENTRY(thread_node) entries;
+} thread_node_t;
+
+SLIST_HEAD(thread_list_head, thread_node);
+struct thread_list_head thread_list = SLIST_HEAD_INITIALIZER(thread_list);
 
 void signal_handler(int signo) {
     syslog(LOG_INFO, "Caught signal, exiting");
     server_stop = 1;
+    if (sockfd != -1) {
+        shutdown(sockfd, SHUT_RDWR); 
+    }
+}
+
+void* client_handler(void *arg) {
+    int clientfd = *(int*)arg;
+    free(arg);
+
+    char buffer[BUFFER_SIZE];
+    ssize_t bytes_received;
+    size_t total_len = 0;
+    char *packet = NULL;
+
+    while ((bytes_received = recv(clientfd, buffer, sizeof(buffer)-1, 0)) > 0) {
+        buffer[bytes_received] = '\0';
+        char *newline_pos = strchr(buffer, '\n');
+        if (!newline_pos) {
+            packet = realloc(packet, total_len + bytes_received + 1);
+            if (!packet) break;
+            memcpy(packet + total_len, buffer, bytes_received + 1);
+            total_len += bytes_received;
+            continue;
+        }
+
+        size_t chunk_len = newline_pos - buffer + 1;
+        packet = realloc(packet, total_len + chunk_len + 1);
+        if (!packet) break;
+        memcpy(packet + total_len, buffer, chunk_len);
+        total_len += chunk_len;
+        packet[total_len] = '\0';
+
+        pthread_mutex_lock(&file_mutex);
+        fwrite(packet, 1, total_len, fp);
+        fflush(fp);
+
+        fseek(fp, 0, SEEK_SET);
+        while (!feof(fp)) {
+            size_t read_len = fread(buffer, 1, sizeof(buffer), fp);
+            if (read_len > 0) send(clientfd, buffer, read_len, 0);
+        }
+        pthread_mutex_unlock(&file_mutex);
+
+        free(packet);
+        packet = NULL;
+        total_len = 0;
+    }
+
+    if (packet) free(packet);
+    close(clientfd);
+    return NULL;
+}
+
+void timestamp_callback(union sigval arg) {
+    time_t now;
+    struct tm *timeinfo;
+    char timestamp[100];
+
+    time(&now);
+    timeinfo = localtime(&now);
+    strftime(timestamp, sizeof(timestamp), TIMESTAMP_FORMAT, timeinfo);
+
+    pthread_mutex_lock(&file_mutex);
+
+    if (fp) {
+        fprintf(fp, "timestamp: %s", timestamp);
+        fflush(fp);
+    }
+
+    pthread_mutex_unlock(&file_mutex);
 }
 
 int main(int argc, char *argv[]) {
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
-    char buffer[BUFFER_SIZE];
     char client_ip[INET_ADDRSTRLEN];
-    ssize_t bytes_received;
-    int sockfd = -1;
-    int clientfd = -1;
-    FILE *fp = NULL;
     int result = -1;
-
     int as_daemon = 0;
 
     if (argc == 2 && strcmp(argv[1], "-d") == 0) {
         as_daemon = 1;
     }
-    
-    openlog("aesdsocket", LOG_PID, LOG_USER);
 
+    openlog("aesdsocket", LOG_PID, LOG_USER);
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
+    fp = fopen(DATA_FILE, "a+");
+    if (!fp) {
+        syslog(LOG_ERR, "Failed to open file: %s", strerror(errno));
+        goto cleanup;
+    }
+    
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd == -1) {
         syslog(LOG_ERR, "Socket creation failed: %s", strerror(errno));
-        return -1;
+        goto cleanup;
     }
-    
+
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -67,16 +156,33 @@ int main(int argc, char *argv[]) {
         pid_t pid = fork();
         if (pid < 0) exit(-1);
         if (pid > 0) exit(EXIT_SUCCESS);
-
         umask(0);
         setsid();
-
-        if (chdir("/") < 0) exit(-1);
-
+        chdir("/");
         close(STDIN_FILENO);
         close(STDOUT_FILENO);
         close(STDERR_FILENO);
-    }    
+    }
+
+    memset(&sev, 0, sizeof(sev));
+    sev.sigev_notify = SIGEV_THREAD;
+    sev.sigev_notify_function = timestamp_callback;
+    sev.sigev_value.sival_ptr = &timerid;
+    
+    if (timer_create(CLOCK_MONOTONIC, &sev, &timerid) == -1) {
+        syslog(LOG_ERR, "timer_create failed");
+        goto cleanup;
+    }
+
+    its.it_value.tv_sec = TIMESTAMP_INTERVAL_SEC;
+    its.it_value.tv_nsec = 0;
+    its.it_interval.tv_sec = TIMESTAMP_INTERVAL_SEC;
+    its.it_interval.tv_nsec = 0;
+    
+    if (timer_settime(timerid, 0, &its, NULL) == -1) {
+        syslog(LOG_ERR, "timer_settime failed");
+        goto cleanup;
+    }
 
     if (listen(sockfd, BACKLOG) != 0) {
         syslog(LOG_ERR, "Listen failed: %s", strerror(errno));
@@ -84,96 +190,48 @@ int main(int argc, char *argv[]) {
     }
 
     while (!server_stop) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(sockfd, &readfds);
+        int *clientfd_ptr = malloc(sizeof(int));
+        if (!clientfd_ptr) continue;
 
-        int sel = select(sockfd + 1, &readfds, NULL, NULL, NULL);
-        if (sel == -1) {
-            if (errno == EINTR) break;
-            syslog(LOG_ERR, "select failed: %s", strerror(errno));
-            break;
+        *clientfd_ptr = accept(sockfd, (struct sockaddr *)&client_addr, &client_addr_len);
+        if (*clientfd_ptr == -1) {
+            free(clientfd_ptr);
+            if (errno == EINTR || server_stop) break;
+            syslog(LOG_ERR, "Accept failed: %s", strerror(errno));
+            continue;
         }
-        
-        if (FD_ISSET(sockfd, &readfds)) {
-            clientfd = accept(sockfd, (struct sockaddr *)&client_addr, &client_addr_len);
-            if (clientfd == -1) {
-                if (errno == EINTR) break; // Interrupted by signal
-                syslog(LOG_ERR, "Accept failed: %s", strerror(errno));
-                continue;
-            }
 
-            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
-            syslog(LOG_INFO, "Accepted connection from %s", client_ip);
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+        syslog(LOG_INFO, "Accepted connection from %s", client_ip);
 
-            fp = fopen(DATA_FILE, "a+");
-            if (!fp) {
-                syslog(LOG_ERR, "Failed to open file: %s", strerror(errno));
-                close(clientfd);
-                continue;
-            }
-
-            size_t total_len = 0;
-            char *packet = NULL;
-
-            while (!server_stop && (bytes_received = recv(clientfd, buffer, sizeof(buffer)-1, 0)) > 0) {
-                buffer[bytes_received] = '\0';
-                char *newline_pos = strchr(buffer, '\n');
-                if (!newline_pos) {
-                    packet = realloc(packet, total_len + bytes_received + 1);
-                    if (!packet) {
-                        syslog(LOG_ERR, "Memory allocation failed");
-                        break;
-                    }
-                    memcpy(packet + total_len, buffer, bytes_received + 1);
-                    total_len += bytes_received;
-                    continue;
-                }
-
-                // include the newline
-                size_t chunk_len = newline_pos - buffer + 1;
-                packet = realloc(packet, total_len + chunk_len + 1);
-                if (!packet) {
-                    syslog(LOG_ERR, "Memory allocation failed");
-                    break;
-                }
-                memcpy(packet + total_len, buffer, chunk_len);
-                total_len += chunk_len;
-                packet[total_len] = '\0';
-
-                fwrite(packet, 1, total_len, fp);
-                fflush(fp);
-
-                // Send full file content
-                fseek(fp, 0, SEEK_SET);
-                while (!feof(fp)) {
-                    size_t read_len = fread(buffer, 1, sizeof(buffer), fp);
-                    if (read_len > 0) send(clientfd, buffer, read_len, 0);
-                }
-
-                free(packet);
-                packet = NULL;
-                total_len = 0;
-            }
-
-            free(packet);
-            fclose(fp);
-            fp = NULL;
-
-            syslog(LOG_INFO, "Closed connection from %s", client_ip);
-            close(clientfd);
-            clientfd = -1;
+        thread_node_t *new_node = malloc(sizeof(thread_node_t));
+        if (!new_node) {
+            close(*clientfd_ptr);
+            free(clientfd_ptr);
+            continue;
         }
+
+        new_node->client_fd = *clientfd_ptr;
+        pthread_create(&new_node->thread_id, NULL, client_handler, clientfd_ptr);
+        SLIST_INSERT_HEAD(&thread_list, new_node, entries);
+    }
+
+    // Join all threads
+    thread_node_t *np;
+    while (!SLIST_EMPTY(&thread_list)) {
+        np = SLIST_FIRST(&thread_list);
+        pthread_join(np->thread_id, NULL);
+        SLIST_REMOVE_HEAD(&thread_list, entries);
+        free(np);
     }
 
     result = 0;
-    
+
 cleanup:
-    if (clientfd != -1) close(clientfd);
+	timer_delete(timerid);
     if (sockfd != -1) close(sockfd);
     if (fp) fclose(fp);
     remove(DATA_FILE);
-    
     closelog();
     
     return result;

@@ -5,12 +5,14 @@ CROSS_COMPILE ?=
 CC = $(CROSS_COMPILE)gcc
 
 # Compiler flags
-CFLAGS = -Wall -Werror -g
+CFLAGS ?= -Wall -Werror -g
 
 # Target binary and sources
-TARGET = aesdsocket
+TARGET ?= aesdsocket
 SRCS = aesdsocket.c
 OBJS = $(SRCS:.c=.o)
+
+LDFLAGS ?= -lpthread -lrt
 
 # Default target
 all: $(TARGET)
@@ -19,7 +21,7 @@ default: all
 
 # Build the target
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) $^ -o $@ $(INCLUDES) $(LDFLAGS)
 
 # Clean target
 clean:
