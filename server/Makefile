@@ -2,7 +2,7 @@
 CROSS_COMPILE ?=
 
 # CC will use CROSS_COMPILE prefix, evaluated at runtime
-CC = $(CROSS_COMPILE)gcc
+CC ?= $(CROSS_COMPILE)gcc
 
 # Compiler flags
 CFLAGS ?= -Wall -Werror -g
