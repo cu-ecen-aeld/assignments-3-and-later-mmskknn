@@ -15,9 +15,17 @@
 #include <sys/queue.h>
 #include <time.h>
 
+#ifndef USE_AESD_CHAR_DEVICE
+# define USE_AESD_CHAR_DEVICE 1
+#endif
+
 #define PORT					(9000)
 #define BACKLOG					(50)
-#define DATA_FILE				"/var/tmp/aesdsocketdata"
+#if USE_AESD_CHAR_DEVICE
+# define DATA_FILE				"/dev/aesdchar"
+#else
+# define DATA_FILE				"/var/tmp/aesdsocketdata"
+#endif
 #define BUFFER_SIZE				(1024)
 #define TIMESTAMP_INTERVAL_SEC	(10)
 #define TIMESTAMP_FORMAT		"%a, %d %b %Y %T %z\n"
@@ -26,10 +34,12 @@ volatile sig_atomic_t server_stop = 0;
 pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int sockfd = -1;
+#if !USE_AESD_CHAR_DEVICE
 FILE* fp = NULL;
 timer_t timerid;
 struct sigevent sev;
 struct itimerspec its;
+#endif
 
 typedef struct thread_node {
     pthread_t thread_id;
@@ -56,7 +66,7 @@ void* client_handler(void *arg) {
     ssize_t bytes_received;
     size_t total_len = 0;
     char *packet = NULL;
-
+    
     while ((bytes_received = recv(clientfd, buffer, sizeof(buffer)-1, 0)) > 0) {
         buffer[bytes_received] = '\0';
         char *newline_pos = strchr(buffer, '\n');
@@ -76,6 +86,32 @@ void* client_handler(void *arg) {
         packet[total_len] = '\0';
 
         pthread_mutex_lock(&file_mutex);
+#if USE_AESD_CHAR_DEVICE
+		int fd = open(DATA_FILE, O_RDWR);
+		if (fd == -1) {
+		    syslog(LOG_ERR, "open error: %s", strerror(errno));
+		    break;
+		}
+		ssize_t write_len = write(fd, packet, total_len);
+		if (write_len < 0) {
+			syslog(LOG_ERR, "write to /dev/aesdchar failed: %s", strerror(errno));
+			close(fd);
+			break;
+		}
+
+		size_t read_len;
+		while ((read_len = read(fd, buffer, sizeof(buffer))) > 0) {
+			if (send(clientfd, buffer, read_len, 0) < 0) {
+				syslog(LOG_ERR, "send to client failed: %s", strerror(errno));
+				close(fd);
+				break;
+			}
+		}
+		if (read_len < 0) {
+			syslog(LOG_ERR, "read from /dev/aesdchar failed: %s", strerror(errno));
+		}
+		close(fd);
+#else
         fwrite(packet, 1, total_len, fp);
         fflush(fp);
 
@@ -84,6 +120,7 @@ void* client_handler(void *arg) {
             size_t read_len = fread(buffer, 1, sizeof(buffer), fp);
             if (read_len > 0) send(clientfd, buffer, read_len, 0);
         }
+ #endif
         pthread_mutex_unlock(&file_mutex);
 
         free(packet);
@@ -96,6 +133,7 @@ void* client_handler(void *arg) {
     return NULL;
 }
 
+#if !USE_AESD_CHAR_DEVICE
 void timestamp_callback(union sigval arg) {
     time_t now;
     struct tm *timeinfo;
@@ -114,6 +152,7 @@ void timestamp_callback(union sigval arg) {
 
     pthread_mutex_unlock(&file_mutex);
 }
+#endif
 
 int main(int argc, char *argv[]) {
     struct sockaddr_in server_addr, client_addr;
@@ -130,11 +169,13 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
+#if !USE_AESD_CHAR_DEVICE
     fp = fopen(DATA_FILE, "a+");
     if (!fp) {
         syslog(LOG_ERR, "Failed to open file: %s", strerror(errno));
         goto cleanup;
     }
+#endif
     
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd == -1) {
@@ -164,6 +205,7 @@ int main(int argc, char *argv[]) {
         close(STDERR_FILENO);
     }
 
+#if !USE_AESD_CHAR_DEVICE
     memset(&sev, 0, sizeof(sev));
     sev.sigev_notify = SIGEV_THREAD;
     sev.sigev_notify_function = timestamp_callback;
@@ -183,6 +225,7 @@ int main(int argc, char *argv[]) {
         syslog(LOG_ERR, "timer_settime failed");
         goto cleanup;
     }
+#endif
 
     if (listen(sockfd, BACKLOG) != 0) {
         syslog(LOG_ERR, "Listen failed: %s", strerror(errno));
@@ -228,10 +271,12 @@ int main(int argc, char *argv[]) {
     result = 0;
 
 cleanup:
-	timer_delete(timerid);
     if (sockfd != -1) close(sockfd);
+#if !USE_AESD_CHAR_DEVICE
+	timer_delete(timerid);
     if (fp) fclose(fp);
     remove(DATA_FILE);
+#endif
     closelog();
     
     return result;
