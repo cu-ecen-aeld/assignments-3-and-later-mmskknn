@@ -22,6 +22,8 @@
 #define PORT					(9000)
 #define BACKLOG					(50)
 #if USE_AESD_CHAR_DEVICE
+# include "../aesd-char-driver/aesd_ioctl.h"
+# define AESD_IOCTL_CMD			"AESDCHAR_IOCSEEKTO:"
 # define DATA_FILE				"/dev/aesdchar"
 #else
 # define DATA_FILE				"/var/tmp/aesdsocketdata"
@@ -92,13 +94,24 @@ void* client_handler(void *arg) {
 		    syslog(LOG_ERR, "open error: %s", strerror(errno));
 		    break;
 		}
-		ssize_t write_len = write(fd, packet, total_len);
-		if (write_len < 0) {
-			syslog(LOG_ERR, "write to /dev/aesdchar failed: %s", strerror(errno));
-			close(fd);
-			break;
-		}
 
+		if (strncmp(packet, AESD_IOCTL_CMD, strlen(AESD_IOCTL_CMD)) == 0) {
+			struct aesd_seekto seekto;
+			if (sscanf(packet, AESD_IOCTL_CMD "%u,%u", &seekto.write_cmd, &seekto.write_cmd_offset) == 2) {
+				if (ioctl(fd, AESDCHAR_IOCSEEKTO, &seekto) < 0) {
+					syslog(LOG_ERR, "ioctl error: %s", strerror(errno));
+				}
+			}
+		}
+		else {
+			ssize_t write_len = write(fd, packet, total_len);
+			if (write_len < 0) {
+				syslog(LOG_ERR, "write to /dev/aesdchar failed: %s", strerror(errno));
+				close(fd);
+				break;
+			}
+		}
+		
 		size_t read_len;
 		while ((read_len = read(fd, buffer, sizeof(buffer))) > 0) {
 			if (send(clientfd, buffer, read_len, 0) < 0) {
